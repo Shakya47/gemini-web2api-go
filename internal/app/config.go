@@ -132,6 +132,7 @@ func defaultConfig() Config {
 		FirefoxFingerprint:     true,
 		StrictModel:            false,
 		StrictModelCooldownMin: 300,
+		StreamIdleTimeoutSec:   120,
 		QueueEnabled:           true,
 		QueueMaxDepth:          20,
 		PacingDelaySec:         20,

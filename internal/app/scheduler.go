@@ -139,6 +139,11 @@ func startScheduler() {
 			case <-proxyReload.C:
 				loadProxies()
 			case <-rotate.C:
+				if s := GetScheduler(); s != nil && s.IsBusy() {
+					logf("[rotate] active request in-flight (slot busy); deferring cookie rotation by 15s")
+					rotate.Reset(15 * time.Second)
+					continue
+				}
 				rotate.Reset(rotateAllAccounts())
 			}
 		}
@@ -547,6 +552,13 @@ func (s *Scheduler) Snapshot() ([]ActiveRequestView, []QueuedRequestView, SlotSt
 	}
 
 	return activeViews, queuedViews, slotView
+}
+
+// IsBusy reports whether an upstream request is actively running in the slot.
+func (s *Scheduler) IsBusy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.slotState == SlotBusy
 }
 
 // aggregateHourlyCatchup walks every hour bucket from the latest aggregated

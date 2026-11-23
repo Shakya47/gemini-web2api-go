@@ -158,6 +158,10 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	case http.MethodPost:
 		if action == "rotate" {
+			if s := GetScheduler(); s != nil && s.IsBusy() {
+				writeJSON(w, 409, map[string]interface{}{"ok": false, "error": "slot_busy", "detail": "cannot rotate cookies while request is actively running in slot"})
+				return
+			}
 			for _, a := range accountList() {
 				if a.ID == id {
 					iv, names, err := rotateAccount(a)

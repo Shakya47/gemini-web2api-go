@@ -19,6 +19,7 @@ func TestBrowserHeadersProfileSwitch(t *testing.T) {
 	// 1. Test Chrome impersonation
 	rtMu.Lock()
 	rtVal.Impersonate = "chrome_146"
+	rtVal.FirefoxFingerprint = false
 	rtMu.Unlock()
 
 	req, _ := http.NewRequest("GET", "https://gemini.google.com/app", nil)

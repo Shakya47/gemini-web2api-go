@@ -239,3 +239,33 @@ func TestScheduler_PriorityOrdering(t *testing.T) {
 	sched.Remove("req-low")
 	sched.Release("req-active", 0)
 }
+
+func TestScheduler_IsBusy(t *testing.T) {
+	sched := &Scheduler{
+		slotState: SlotIdle,
+		queue:     make([]*queuedItem, 0),
+	}
+	sched.cond = syncNewCond(&sched.mu)
+	go sched.loop()
+
+	if sched.IsBusy() {
+		t.Errorf("expected IsBusy=false on idle scheduler")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = sched.Enqueue(ctx, "req-busy", "p1", "model", PriorityP2Standard, 10, false, "chat", nil) }()
+	time.Sleep(30 * time.Millisecond)
+
+	if !sched.IsBusy() {
+		t.Errorf("expected IsBusy=true while request is running in slot")
+	}
+
+	sched.Release("req-busy", 0)
+	time.Sleep(10 * time.Millisecond)
+
+	if sched.IsBusy() {
+		t.Errorf("expected IsBusy=false after request release")
+	}
+}

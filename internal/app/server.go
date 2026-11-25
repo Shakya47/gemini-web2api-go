@@ -155,7 +155,12 @@ func writeRateLimitError(w http.ResponseWriter, err error) {
 
 func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interface{},
 	images []pendingUpload, onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	res, err := streamGenerateWithFiles(prompt, latest, mc, images, onDelta, onReasoning)
+	return callGeminiCtx(context.Background(), prompt, latest, mc, tools, images, onDelta, onReasoning)
+}
+
+func callGeminiCtx(ctx context.Context, prompt, latest string, mc ModelConfig, tools []map[string]interface{},
+	images []pendingUpload, onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
+	res, err := streamGenerateWithFilesCtx(ctx, prompt, latest, mc, images, onDelta, onReasoning)
 	if err != nil {
 		// res 非 nil：失败时它只带归属（哪个号 / 哪个出口），给 recordRequest 用
 		return "", nil, res, err
@@ -388,7 +393,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
 		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
+		text, toolCalls, res, err = callGeminiCtx(r.Context(), prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
 	}
 	if res != nil {
 		sched.UpdateActive(cid, res.UpstreamModel, countTokens(text))
@@ -762,7 +767,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
 		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, nil, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
+		text, toolCalls, res, err = callGeminiCtx(r.Context(), prompt, latest, modelCfg, tools, images, onDelta, nil)
 	}
 	if ka != nil {
 		ka.Stop()

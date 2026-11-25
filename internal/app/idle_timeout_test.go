@@ -1,12 +1,17 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
 // 上游开流后长时间不来 chunk（#81 实测：首字节 2 秒就到、之后 200 多秒静默）：
@@ -110,5 +115,99 @@ func TestIdleTimeoutRetrySemantics(t *testing.T) {
 	}
 	if !retryAfterTimeout(errIdleTimeout) {
 		t.Error("errIdleTimeout 应当总是重试")
+	}
+}
+
+func TestReadBodyWithIdle_BlankKeepaliveDoesNotReset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fl := w.(http.Flusher)
+		w.Write([]byte("frame1\n"))
+		fl.Flush()
+		for i := 0; i < 8; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(60 * time.Millisecond):
+				w.Write([]byte("\n"))
+				fl.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	start := time.Now()
+	_, _, err = readBodyWithIdle(resp.Body, nil, start, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	if err != errIdleTimeout {
+		t.Fatalf("expected errIdleTimeout despite blank keepalive lines, got %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("watchdog fired too slowly (%v)", elapsed)
+	}
+}
+
+func TestReadBodyWithIdle_TLSClientHTTP2(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fl := w.(http.Flusher)
+		w.Write([]byte("frame1\n"))
+		fl.Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	tc, err := tls_client.NewHttpClient(
+		tls_client.NewNoopLogger(),
+		tls_client.WithTimeoutSeconds(5),
+		tls_client.WithClientProfile(profiles.Chrome_146),
+		tls_client.WithInsecureSkipVerify(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := fhttp.NewRequest("POST", srv.URL, strings.NewReader("x=1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := tc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	start := time.Now()
+	_, _, err = readBodyWithIdle(resp.Body, nil, start, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	if err != errIdleTimeout {
+		t.Fatalf("expected errIdleTimeout over tls-client H2, got %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("tls-client idle watchdog took too long (%v)", elapsed)
+	}
+}
+
+func TestDoGeminiRequestCtx_ClientCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	// Route through proxy branch of doGeminiRequestCtx using a no-op local server check
+	// via canceled ctx before request is sent.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _, _, err := doGeminiRequestCtx(ctx, srv.URL, "f.req=1", nil, srv.URL, nil)
+	if err == nil {
+		t.Fatal("expected error when caller ctx is canceled")
 	}
 }

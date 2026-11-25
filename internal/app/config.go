@@ -97,7 +97,7 @@ func defaultConfig() Config {
 		RetryAttempts:  3,
 		RetryDelaySec:  2,
 		RequestTimeout: 600,
-		RetryOnTimeout: true,
+		RetryOnTimeout: false,
 		GeminiBL:       "boq_gemini-web-uiserver_20261007.01_p0",
 		DefaultModel:   "gemini-3.6-flash",
 		LogRequests:    true,

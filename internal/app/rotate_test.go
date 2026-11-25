@@ -154,3 +154,25 @@ func TestSIDCCBackoff(t *testing.T) {
 		t.Fatal("backoff should end once the deadline passes")
 	}
 }
+
+func TestRecordRotateRateLimitExponential(t *testing.T) {
+	const id int64 = -987655
+	defer clearRotateRateLimit(id)
+
+	b1 := recordRotateRateLimit(id, 600*time.Second)
+	if b1 < 12*time.Minute {
+		t.Fatalf("first backoff should exceed hfcr 10m window, got %s", b1)
+	}
+	b2 := recordRotateRateLimit(id, 600*time.Second)
+	if b2 <= b1 {
+		t.Fatalf("second consecutive 429 should back off exponentially: b1=%s b2=%s", b1, b2)
+	}
+	b3 := recordRotateRateLimit(id, 600*time.Second)
+	if b3 > 60*time.Minute {
+		t.Fatalf("backoff should cap at 60m, got %s", b3)
+	}
+	clearRotateRateLimit(id)
+	if left := sidccBackoffLeft(id); left != 0 {
+		t.Fatalf("expected backoff cleared, got %s", left)
+	}
+}

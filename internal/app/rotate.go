@@ -74,7 +74,18 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 	c2, n, err := tryRotate1PSIDTS(a.ID, cookie, proxyURL)
 	if err != nil {
 		psidtsErr = err
-		logf("[rotate] 账号 #%d 刷新 1PSIDTS 失败: %v", a.ID, err)
+		var rl *rotateRateLimitedError
+		if errors.As(err, &rl) {
+			backoff := recordRotateRateLimit(a.ID, rl.RetryAfter)
+			logf("[rotate] 账号 #%d 1PSIDTS 保活被限流（RotateCookies 429），%s 内不再请求", a.ID, backoff)
+		} else {
+			if strings.Contains(err.Error(), "identity.hfcr") {
+				backoff := recordRotateRateLimit(a.ID, rotateRetryAfter([]byte(err.Error())))
+				logf("[rotate] 账号 #%d 1PSIDTS 触发 Google 风控（%s 内不再请求）: %v", a.ID, backoff, err)
+			} else {
+				logf("[rotate] 账号 #%d 刷新 1PSIDTS 失败: %v", a.ID, err)
+			}
+		}
 	} else {
 		cookie = c2
 		names = append(names, n...)
@@ -89,9 +100,9 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 		switch {
 		case errors.As(err, &rl):
 			sidccErr = err
-			noteSIDCCBackoff(a.ID, rl.RetryAfter)
+			backoff := recordRotateRateLimit(a.ID, rl.RetryAfter)
 			logf("[rotate] 账号 #%d SIDCC 保活被限流（RotateCookies 429），%s 内不再请求",
-				a.ID, rl.RetryAfter)
+				a.ID, backoff)
 		case err != nil:
 			sidccErr = err
 			logf("[rotate] 账号 #%d SIDCC 保活失败: %v", a.ID, err)
@@ -102,6 +113,10 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 				interval = iv
 			}
 		}
+	}
+
+	if len(names) > 0 && psidtsErr == nil && sidccErr == nil {
+		clearRotateRateLimit(a.ID)
 	}
 
 	names = uniqueKeepOrder(names)
@@ -130,6 +145,9 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 func tryRotate1PSIDTS(id int64, cookie, proxyURL string) (string, []string, error) {
 	if cookieValue(cookie, "__Secure-1PSID") == "" {
 		return cookie, nil, nil
+	}
+	if left := sidccBackoffLeft(id); left > 0 {
+		return cookie, nil, fmt.Errorf("RotateCookies 处于限流退避中，%s 后再试", left.Round(time.Second))
 	}
 	if ok, _ := allow1PSIDTSRotate(id); !ok {
 		logf("[rotate] 账号 #%d 跳过 1PSIDTS 刷新（距上次不足 %s，避免 429）", id, min1PSIDTSInterval)
@@ -189,6 +207,9 @@ func rotate1PSIDTS(cookie, proxyURL string) (string, []string, error) {
 	status, setCookie, respBody, err := rotatePost(rotatePostURL, headers, []byte(rotate1PSIDTSBody), proxyURL)
 	if err != nil {
 		return cookie, nil, err
+	}
+	if status == 429 {
+		return cookie, nil, &rotateRateLimitedError{RetryAfter: rotateRetryAfter(respBody)}
 	}
 	if status == 401 || status == 403 {
 		return cookie, nil, fmt.Errorf("RotateCookies 1PSIDTS 返回 HTTP %d（Chrome 导出的 cookie 可能受设备绑定限制，建议用 Firefox 重新导出）: %s",
@@ -250,19 +271,105 @@ func rotateRetryAfter(body []byte) time.Duration {
 var (
 	sidccMu       sync.Mutex
 	sidccResumeAt = map[int64]time.Time{}
+	sidccStreak   = map[int64]int{}
 )
 
+func rotateBackoffKey(id int64) string {
+	return fmt.Sprintf("rotate_backoff_%d", id)
+}
+
+func persistRotateBackoff(id int64, until time.Time, streak int) {
+	if db == nil || id <= 0 {
+		return
+	}
+	if until.IsZero() || !until.After(time.Now()) {
+		kvSet(rotateBackoffKey(id), "")
+		return
+	}
+	kvSet(rotateBackoffKey(id), fmt.Sprintf("%d:%d", until.Unix(), streak))
+}
+
+func loadPersistedRotateBackoff(id int64) (time.Time, int) {
+	if db == nil || id <= 0 {
+		return time.Time{}, 0
+	}
+	raw := kvGet(rotateBackoffKey(id))
+	if raw == "" {
+		return time.Time{}, 0
+	}
+	parts := strings.SplitN(raw, ":", 2)
+	sec, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || sec <= 0 {
+		return time.Time{}, 0
+	}
+	streak := 0
+	if len(parts) == 2 {
+		streak, _ = strconv.Atoi(parts[1])
+	}
+	return time.Unix(sec, 0), streak
+}
+
 func noteSIDCCBackoff(id int64, d time.Duration) {
+	until := time.Now().Add(d)
 	sidccMu.Lock()
-	sidccResumeAt[id] = time.Now().Add(d)
+	sidccResumeAt[id] = until
+	streak := sidccStreak[id]
 	sidccMu.Unlock()
+	persistRotateBackoff(id, until, streak)
+}
+
+// recordRotateRateLimit backs off RotateCookies past Google's identity.hfcr window
+// (+2m margin, minimum 15m, doubling up to 60m on consecutive hits) and persists
+// the cooldown across container restarts so we don't turn 429s into 401 revocations.
+func recordRotateRateLimit(id int64, retryAfter time.Duration) time.Duration {
+	base := retryAfter + 2*time.Minute
+	if base < 15*time.Minute {
+		base = 15 * time.Minute
+	}
+	sidccMu.Lock()
+	if _, ok := sidccResumeAt[id]; !ok {
+		if u, s := loadPersistedRotateBackoff(id); !u.IsZero() {
+			sidccResumeAt[id] = u
+			sidccStreak[id] = s
+		}
+	}
+	streak := sidccStreak[id]
+	backoff := base << streak
+	if backoff > 60*time.Minute || backoff <= 0 {
+		backoff = 60 * time.Minute
+	}
+	if streak < 3 {
+		sidccStreak[id] = streak + 1
+	}
+	until := time.Now().Add(backoff)
+	sidccResumeAt[id] = until
+	newStreak := sidccStreak[id]
+	sidccMu.Unlock()
+	persistRotateBackoff(id, until, newStreak)
+	return backoff
+}
+
+func clearRotateRateLimit(id int64) {
+	sidccMu.Lock()
+	delete(sidccResumeAt, id)
+	delete(sidccStreak, id)
+	sidccMu.Unlock()
+	persistRotateBackoff(id, time.Time{}, 0)
 }
 
 // sidccBackoffLeft 返回还要等多久，不在退避中返回 0。
 func sidccBackoffLeft(id int64) time.Duration {
 	sidccMu.Lock()
-	defer sidccMu.Unlock()
-	if left := time.Until(sidccResumeAt[id]); left > 0 {
+	until, ok := sidccResumeAt[id]
+	if !ok {
+		if u, s := loadPersistedRotateBackoff(id); !u.IsZero() {
+			until = u
+			sidccResumeAt[id] = u
+			sidccStreak[id] = s
+		}
+	}
+	sidccMu.Unlock()
+	if left := time.Until(until); left > 0 {
 		return left
 	}
 	return 0
@@ -428,6 +535,10 @@ func rotateAllAccounts() time.Duration {
 	next := defaultRotateInterval
 	for _, a := range accountList() {
 		if a.Status != "enabled" {
+			continue
+		}
+		if left := sidccBackoffLeft(a.ID); left > 0 {
+			logf("[rotate] 账号 #%d 处于限流退避中（剩余 %s），跳过本次保活", a.ID, left.Round(time.Second))
 			continue
 		}
 		iv, _, err := rotateAccount(a)

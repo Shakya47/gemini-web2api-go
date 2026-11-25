@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -445,13 +446,24 @@ type fileRef struct {
 // 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
 func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
+	return streamGenerateWithFilesCtx(context.Background(), prompt, latest, mc, pending, onDelta, onReasoning)
+}
+
+func streamGenerateWithFilesCtx(ctx context.Context, prompt, latest string, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string)) (*StreamResult, error) {
 	// strict_model 换号：被降级的号记冷却、本次排除，换下一个号重来。上限跟 XSRF 换号
 	// 一样是 maxCookieTries——连着几个号都降级，说明池子整体见底，不是撞上个别号。
 	exclude := map[int64]bool{}
 	var res *StreamResult
 	var err error
 	for try := 0; try < maxCookieTries; try++ {
-		next, nextErr := streamGenerateOnce(prompt, latest, mc, pending, onDelta, onReasoning, exclude)
+		if ctx.Err() != nil {
+			if err != nil {
+				return res, err
+			}
+			return &StreamResult{}, ctx.Err()
+		}
+		next, nextErr := streamGenerateOnceCtx(ctx, prompt, latest, mc, pending, onDelta, onReasoning, exclude)
 		var exhausted *ModelDowngradedError
 		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
 			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
@@ -470,6 +482,11 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 }
 
 func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
+	return streamGenerateOnceCtx(context.Background(), prompt, latest, mc, pending, onDelta, onReasoning, exclude)
+}
+
+func streamGenerateOnceCtx(ctx context.Context, prompt, latest string, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
 	var files []fileRef
 
@@ -862,6 +879,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		Cookie: cookieStr, SAPISID: sapisid, AuthUser: authUser,
 	}
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
 		var statusCode int
 		var raw []byte
 		var ttfb int64
@@ -871,7 +892,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			wcReq.Cookie = cookieStr
 			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(wcReq, proxyURL, lineCB)
 		} else {
-			statusCode, raw, ttfb, setCookie, err = doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			statusCode, raw, ttfb, setCookie, err = doGeminiRequestCtx(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB)
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
@@ -906,7 +927,12 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				select {
+				case <-ctx.Done():
+					lastErr = ctx.Err()
+					return attrib(lastErr)
+				case <-time.After(time.Duration(rtCfg().RetryDelaySec) * time.Second):
+				}
 			}
 			continue
 		}
@@ -1121,11 +1147,39 @@ func setAuthUserHeaders(h map[string]string, authuser int) {
 // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
 func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
 	onLine func(string) error) (int, []byte, int64, []string, error) {
+	return doGeminiRequestCtx(context.Background(), endpoint, body, headers, proxyURL, onLine)
+}
+
+func doGeminiRequestCtx(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
+	onLine func(string) error) (int, []byte, int64, []string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	sendAt := time.Now()
 	idle := time.Duration(rtCfg().StreamIdleTimeoutSec) * time.Second
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+	var headerTimedOut atomic.Bool
+	startHeaderGuard := func() chan struct{} {
+		if idle <= 0 {
+			return nil
+		}
+		done := make(chan struct{})
+		go func() {
+			t := time.NewTimer(idle)
+			defer t.Stop()
+			select {
+			case <-done:
+			case <-t.C:
+				headerTimedOut.Store(true)
+				cancelReq()
+			}
+		}()
+		return done
+	}
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
-		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
+		req, err := http.NewRequestWithContext(reqCtx, "POST", endpoint, strings.NewReader(body))
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
@@ -1134,8 +1188,15 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 			req.Header.Set(k, v)
 		}
 		client := getStdlibClient(proxyURL)
+		headerDone := startHeaderGuard()
 		resp, err := client.Do(req)
+		if headerDone != nil {
+			close(headerDone)
+		}
 		if err != nil {
+			if headerTimedOut.Load() && ctx.Err() == nil {
+				return 0, nil, 0, nil, errIdleTimeout
+			}
 			return 0, nil, 0, nil, err
 		}
 		defer resp.Body.Close()
@@ -1147,7 +1208,7 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	}
 
 	// 直连 → tls-client，保留 chrome146 TLS/HTTP2 真指纹
-	req, err := fhttp.NewRequest("POST", endpoint, strings.NewReader(body))
+	req, err := fhttp.NewRequestWithContext(reqCtx, "POST", endpoint, strings.NewReader(body))
 	if err != nil {
 		return 0, nil, 0, nil, err
 	}
@@ -1156,8 +1217,15 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		req.Header.Set(k, v)
 	}
 	client := getTLSClient()
+	headerDone := startHeaderGuard()
 	resp, err := client.Do(req)
+	if headerDone != nil {
+		close(headerDone)
+	}
 	if err != nil {
+		if headerTimedOut.Load() && ctx.Err() == nil {
+			return 0, nil, 0, nil, errIdleTimeout
+		}
 		return 0, nil, 0, nil, err
 	}
 	defer resp.Body.Close()
@@ -1191,14 +1259,15 @@ func readBodyActivity(r io.Reader, onLine func(string) error, start time.Time, o
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	var ttfb int64 = -1
 	for sc.Scan() {
-		if onActivity != nil {
+		line := sc.Text()
+		if onActivity != nil && strings.TrimSpace(line) != "" {
 			onActivity()
 		}
 		if ttfb < 0 {
 			ttfb = time.Since(start).Milliseconds()
 		}
 		if onLine != nil {
-			if err := onLine(sc.Text()); err != nil {
+			if err := onLine(line); err != nil {
 				return buf.Bytes(), ttfb, err
 			}
 		}
